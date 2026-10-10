@@ -53,20 +53,177 @@ def get_meta(video_id: str) -> dict:
 
 
 def fetch_transcript(video_id: str, lang: str):
+    return fetch_transcript_smart(video_id, lang)
+
+
+# 클라우드 IP 차단 시 우회용 미러 목록 (Invidious 공개 인스턴스)
+INVIDIOUS = [
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://iv.duti.dev",
+    "https://vid.puffyan.us",
+]
+
+
+def _parse_caption_text(raw: str):
+    """VTT/TTML 자막 원문을 [(start초, 텍스트)] 로 변환."""
+    import html as _html
+    import re as _re
+    out = []
+
+    def ts2s(t: str) -> float:
+        t = t.replace(",", ".")
+        parts = t.split(":")
+        s = float(parts[-1])
+        m = int(parts[-2]) if len(parts) > 1 else 0
+        h = int(parts[-3]) if len(parts) > 2 else 0
+        return h * 3600 + m * 60 + s
+
+    # TTML/XML: <p begin="00:00:01.200" ...>텍스트</p>
+    for m in _re.finditer(r'<p[^>]*begin="([\d:.,]+)"[^>]*>(.*?)</p>', raw, _re.S):
+        txt = _re.sub(r"<[^>]+>", "", m.group(2))
+        txt = _html.unescape(txt).strip()
+        if txt:
+            out.append((ts2s(m.group(1)), txt))
+    if out:
+        return out
+    # WebVTT: 00:00:01.200 --> 00:00:03.400
+    blocks = _re.split(r"\n\s*\n", raw)
+    for b in blocks:
+        m = _re.search(r"([\d:.,]+)\s*-->\s*([\d:.,]+)\s*\n(.*)", b, _re.S)
+        if m:
+            txt = _re.sub(r"<[^>]+>", "", m.group(3))
+            txt = _html.unescape(txt).replace("\n", " ").strip()
+            if txt and "WEBVTT" not in txt:
+                out.append((ts2s(m.group(1)), txt))
+    return out
+
+
+class _Snip:
+    def __init__(self, start, text):
+        self.start = start
+        self.text = text
+
+
+class _Data:
+    def __init__(self, snippets):
+        self.snippets = snippets
+
+
+def fetch_via_invidious(video_id: str, lang: str):
+    """차단 우회: Invidious 미러에서 자막 가져오기."""
+    order = ([lang] if lang != "auto" else []) + ["ko", "en"]
+    last = None
+    for base in INVIDIOUS:
+        try:
+            r = requests.get(f"{base}/api/v1/captions/{video_id}", timeout=20)
+            if r.status_code != 200:
+                continue
+            tracks = r.json()
+            if not isinstance(tracks, list) or not tracks:
+                continue
+            pick = None
+            for lg in order:
+                for t in tracks:
+                    code = (t.get("languageCode") or t.get("language_code") or "")
+                    if code.split("-")[0].lower() == lg.lower():
+                        pick = t
+                        break
+                if pick:
+                    break
+            if pick is None:
+                pick = tracks[0]
+            url = pick.get("url", "")
+            if url.startswith("/"):
+                url = base + url
+            t = requests.get(url, timeout=20)
+            if t.status_code != 200 or not t.text.strip():
+                continue
+            segs = _parse_caption_text(t.text)
+            if not segs:
+                continue
+            code = (pick.get("languageCode") or pick.get("language_code") or "?")
+            print(f"우회 성공: {base} ({code}, {len(segs)} segments)")
+            return _Data([_Snip(s, x) for s, x in segs]), code
+        except Exception as e:
+            last = e
+            continue
+    raise RuntimeError(f"Invidious 우회 실패: {last}")
+
+
+def fetch_via_supadata(video_id: str, lang: str):
+    """유료 우회(무료 100건/월): Supadata API. 환경변수 SUPADATA_KEY 필요."""
+    import os as _os
+    key = _os.environ.get("SUPADATA_KEY", "").strip()
+    if not key:
+        raise RuntimeError("SUPADATA_KEY 없음")
+    langs = ([lang] if lang != "auto" else []) + ["ko", "en"]
+    last = None
+    for lg in langs:
+        try:
+            r = requests.get(
+                "https://api.supadata.ai/v1/youtube/transcript",
+                params={"videoId": video_id, "lang": lg},
+                headers={"x-api-key": key},
+                timeout=40,
+            )
+            if r.status_code != 200:
+                last = f"HTTP {r.status_code}"
+                continue
+            j = r.json()
+            items = j.get("content") or j.get("transcript") or []
+            segs = [(float(x.get("offset", 0)) / 1000.0
+                     if float(x.get("offset", 0)) > 1000 else float(x.get("offset", 0)),
+                     str(x.get("text", "")).strip())
+                    for x in items if str(x.get("text", "")).strip()]
+            if not segs:
+                last = "empty"
+                continue
+            print(f"우회 성공: supadata ({lg}, {len(segs)} segments)")
+            return _Data([_Snip(s, x) for s, x in segs]), lg
+        except Exception as e:
+            last = e
+            continue
+    raise RuntimeError(f"supadata 실패: {last}")
+
+
+def fetch_transcript_smart(video_id: str, lang: str):
+    """직접 시도 → 차단 시 우회(supadata→invidious). 기존 반환 형식과 동일."""
     api = YouTubeTranscriptApi()
-    tracks = list(api.list(video_id))
+    try:
+        tracks = list(api.list(video_id))
+    except Exception as e:
+        name = type(e).__name__
+        if "Blocked" in name:
+            print(f"직접 차단({name}). 우회 시도...")
+            try:
+                return fetch_via_supadata(video_id, lang)
+            except Exception as e2:
+                print(f"supadata 스킵: {e2}")
+            return fetch_via_invidious(video_id, lang)
+        raise
     langs = [t.language_code for t in tracks]
     print(f"사용 가능 자막: {langs}")
     order = [lang] if lang != "auto" else []
     order += ["ko", "en"]
+    blocked = False
     for lg in order:
         try:
             data = api.fetch(video_id, languages=[lg])
             print(f"선택 자막: {lg} ({len(data.snippets)} segments)")
             return data, lg
-        except Exception:
+        except Exception as e:
+            if "Blocked" in type(e).__name__:
+                blocked = True
+                break
             continue
-    # 최후: 첫 번째 트랙
+    if blocked:
+        print("직접 차단. 우회 시도...")
+        try:
+            return fetch_via_supadata(video_id, lang)
+        except Exception as e:
+            print(f"supadata 스킵: {e}")
+        return fetch_via_invidious(video_id, lang)
     t0 = tracks[0]
     data = api.fetch(video_id, languages=[t0.language_code])
     print(f"선택 자막: {t0.language_code} ({len(data.snippets)} segments)")
