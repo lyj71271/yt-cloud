@@ -2,15 +2,12 @@
 로컬 실행: uvicorn server:app --port 8789
 외출용: Render/Railway에 이 폴더 배포.
 """
-import sys
 from pathlib import Path
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-sys.path.insert(0, r"D:\MyProject\yt-script")
-import yt_script as core  # 기존 추출 로직 재사용
+import yt_script as core  # 같은 폴더. 기존 추출 로직 재사용
 
 app = FastAPI(title="yt-script API")
 app.add_middleware(
