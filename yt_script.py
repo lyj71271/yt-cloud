@@ -207,6 +207,7 @@ def fetch_transcript_smart(video_id: str, lang: str):
     order = [lang] if lang != "auto" else []
     order += ["ko", "en"]
     blocked = False
+    failed = None
     for lg in order:
         try:
             data = api.fetch(video_id, languages=[lg])
@@ -216,14 +217,20 @@ def fetch_transcript_smart(video_id: str, lang: str):
             if "Blocked" in type(e).__name__:
                 blocked = True
                 break
+            failed = e
             continue
-    if blocked:
-        print("직접 차단. 우회 시도...")
+    if blocked or failed is not None:
+        print(f"직접 실패({type(failed).__name__ if failed else 'Blocked'}). 우회 시도...")
         try:
             return fetch_via_supadata(video_id, lang)
         except Exception as e:
             print(f"supadata 스킵: {e}")
-        return fetch_via_invidious(video_id, lang)
+        try:
+            return fetch_via_invidious(video_id, lang)
+        except Exception:
+            pass
+        if failed is not None:
+            raise failed
     t0 = tracks[0]
     data = api.fetch(video_id, languages=[t0.language_code])
     print(f"선택 자막: {t0.language_code} ({len(data.snippets)} segments)")
